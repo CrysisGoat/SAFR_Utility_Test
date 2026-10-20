@@ -38,7 +38,11 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      // Keep timers running at full rate while the window is minimised or
+      // behind another app (e.g. StarLab during an LI sweep). Chromium otherwise
+      // throttles background timers, which would stretch the sweep's steps.
+      backgroundThrottling: false
     }
   });
 
