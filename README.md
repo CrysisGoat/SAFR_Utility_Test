@@ -31,6 +31,31 @@ Download is available for Linux / Windows [HERE](https://github.com/Nat-As/SAFR_
 > protection for your setup before using it.
 
 
+### LI sweep
+
+**Run LI Sweep** automates an LI (light–current) curve so the whole run lands in
+one power-meter recording:
+
+1. Start the recording in StarLab.
+2. Check the sweep settings (default **0.50 → 2.00 A in 0.10 A steps, 10 s hold**,
+   which is 16 steps and 2 min 40 s) and press **Run LI Sweep**, then confirm.
+3. The app sets the start current, turns the output on, raises the current one
+   step every hold period, and turns the output **off** after the hold at the
+   top current. The setpoint is then parked back at the start current so the
+   next manual **On** does not fire at full current.
+4. Stop the StarLab recording once the status line reports the sweep complete.
+
+The status line under the button shows the step, the current and the time left.
+**Abort Sweep** or **Off** stops the sweep and turns the output off at once, and
+so does disconnecting. If the board reports the output off mid-sweep (interlock
+or fault), the sweep stops instead of stepping on. The current field, **On** and
+manual commands are locked while a sweep runs so nothing fights over the
+setpoint.
+
+Steps are timed against the sweep's start, not the previous step, so they stay
+on an exact grid; the window keeps full-rate timers even when minimised or
+behind StarLab.
+
 ### Sending raw commands
 
 **Manual Command** sends any string the board understands, verbatim, with `\r\n`

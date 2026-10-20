@@ -1,7 +1,7 @@
 {
   "name": "safr-utility",
   "productName": "SAFR Utility",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Serial control and monitoring utility for the SAFR 247nm laser board",
   "main": "src/main.js",
   "author": "Alakai Defense Systems",
