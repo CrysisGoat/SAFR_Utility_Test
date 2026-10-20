@@ -61,7 +61,13 @@ const ui = {
   resetButton: el('resetButton'),
   monitorPauseFlag: el('monitorPauseFlag'),
   monitorClearButton: el('monitorClearButton'),
-  monitorLog: el('monitorLog')
+  monitorLog: el('monitorLog'),
+  sweepStartField: el('sweepStartField'),
+  sweepEndField: el('sweepEndField'),
+  sweepStepField: el('sweepStepField'),
+  sweepHoldField: el('sweepHoldField'),
+  sweepStatus: el('sweepStatus'),
+  sweepButton: el('sweepButton')
 };
 
 const state = {
@@ -78,7 +84,9 @@ const state = {
   y: SERIES.map(() => []),
   recording: false,
   logPath: null,
-  pendingRows: []
+  pendingRows: [],
+  sweep: null,
+  sweepTimer: null
 };
 
 const plot = new window.DualAxisPlot(ui.plotCanvas, {
@@ -202,10 +210,16 @@ function setConnectedUI(connected) {
     ui.tecDiagnosticFlag,
     ui.manualCommandField,
     ui.manualSendButton,
-    ui.recordButton
+    ui.recordButton,
+    ui.sweepStartField,
+    ui.sweepEndField,
+    ui.sweepStepField,
+    ui.sweepHoldField,
+    ui.sweepButton
   ].forEach((node) => {
     node.disabled = !connected;
   });
+  describeSweepPlan();
 
   if (!connected) {
     ui.laserPowerFlag.checked = false;
@@ -244,6 +258,7 @@ function handleSafrEvent(name, payload) {
       ui.laserPowerFlag.checked = payload[0] !== 0;
       ui.currentField.value = Number.isFinite(payload[1]) ? payload[1].toFixed(2) : '';
       ui.laserTimeoutFlag.checked = payload[3] === 0;
+      watchSweepOutput(payload[0] !== 0);
       break;
     case 'disconnect':
       setStatus('Serial port closed by the device.', 'error');
@@ -316,6 +331,10 @@ async function connect() {
 
 async function disconnect() {
   stopTimer();
+  if (state.sweep && state.sweep.running) {
+    state.sweep.abort('Sweep stopped: disconnected.');
+    await waitForTx(500); // let lO0 reach the board before the port closes
+  }
   if (state.recording) await stopRecording();
 
   const safr = state.safr;
@@ -548,7 +567,10 @@ ui.laserOnButton.addEventListener('click', () => {
 });
 
 ui.laserOffButton.addEventListener('click', () => {
-  if (requireLink()) state.safr.laserOutputOff();
+  if (!requireLink()) return;
+  // Off always wins: during a sweep it stops the sweep (which sends lO0).
+  if (state.sweep && state.sweep.running) state.sweep.abort('Sweep stopped with the Off button. Laser off.');
+  else state.safr.laserOutputOff();
 });
 
 ui.tecDiagnosticFlag.addEventListener('change', () => {
@@ -605,9 +627,155 @@ ui.monitorClearButton.addEventListener('click', () => {
 });
 
 window.addEventListener('beforeunload', () => {
+  if (state.sweep && state.sweep.running) state.sweep.abort('Window closed.');
   stopTimer();
   if (state.safr) state.safr.close();
 });
+
+// -------------------------------------------------------------------- LI sweep
+
+const SWEEP_FIELDS = () => [ui.sweepStartField, ui.sweepEndField, ui.sweepStepField, ui.sweepHoldField];
+
+function readSweepFields() {
+  return {
+    startA: parseFloat(ui.sweepStartField.value),
+    endA: parseFloat(ui.sweepEndField.value),
+    stepA: parseFloat(ui.sweepStepField.value),
+    holdS: parseFloat(ui.sweepHoldField.value)
+  };
+}
+
+function formatDuration(seconds) {
+  const s = Math.round(seconds);
+  const m = Math.floor(s / 60);
+  return m ? `${m}:${String(s % 60).padStart(2, '0')}` : `${s} s`;
+}
+
+function setSweepStatus(text, kind = '') {
+  ui.sweepStatus.textContent = text;
+  ui.sweepStatus.className = `sweep-status ${kind}`.trim();
+}
+
+/** Idle readout: how many steps and how long, or what is wrong with the fields. */
+function describeSweepPlan() {
+  if (state.sweep && state.sweep.running) return;
+  if (!state.safr) {
+    setSweepStatus('Connect to run a sweep.');
+    return;
+  }
+  try {
+    const { startA, endA, stepA, holdS } = readSweepFields();
+    if (!(holdS > 0)) throw new Error('Hold time must be greater than zero.');
+    const levels = window.LISweep.plan({ startA, endA, stepA });
+    setSweepStatus(`${levels.length} steps, ${formatDuration(levels.length * holdS)} total`);
+    ui.sweepButton.disabled = false;
+  } catch (err) {
+    setSweepStatus(err.message, 'error');
+    ui.sweepButton.disabled = true;
+  }
+}
+
+/** Lock out controls that would fight the sweep for the current setpoint. */
+function setSweepUI(running) {
+  const connected = Boolean(state.safr);
+  [ui.laserOnButton, ui.currentSetField, ui.manualCommandField, ui.manualSendButton, ...SWEEP_FIELDS()].forEach((node) => {
+    node.disabled = running || !connected;
+  });
+  ui.sweepButton.textContent = running ? 'Abort Sweep' : 'Run LI Sweep';
+  ui.sweepButton.classList.toggle('active', running);
+  ui.sweepButton.title = running
+    ? 'Stops the sweep and turns the laser off'
+    : 'Turns the laser on at the start current, steps it every hold period, then turns it off';
+}
+
+function showSweepProgress() {
+  const sweep = state.sweep;
+  if (!sweep || !sweep.running) return;
+  const st = sweep.status();
+  setSweepStatus(
+    `Step ${st.index + 1}/${st.total} · ${st.amps.toFixed(2)} A · ` +
+      `${Math.ceil(st.stepRemainingS)} s · ${formatDuration(st.totalRemainingS)} left`,
+    'running'
+  );
+}
+
+function startSweep() {
+  if (!requireLink()) return;
+
+  let sweep;
+  try {
+    sweep = new window.LISweep({
+      safr: state.safr,
+      ...readSweepFields(),
+      onStep: ({ index, total, amps }) => {
+        logMonitor(`# LI sweep step ${index + 1}/${total}: ${amps.toFixed(2)} A`, 'tx');
+        showSweepProgress();
+      },
+      onDone: ({ completed, reason }) => {
+        window.clearInterval(state.sweepTimer);
+        state.sweepTimer = null;
+        setSweepUI(false);
+        if (completed) {
+          setStatus('LI sweep complete. Laser off. You can stop the StarLab recording.', 'ok');
+          logMonitor('# LI sweep complete, laser off', 'tx');
+        } else {
+          setStatus(reason, 'error');
+          logMonitor(`# ${reason}`, 'err');
+        }
+        describeSweepPlan();
+      }
+    });
+  } catch (err) {
+    setSweepStatus(err.message, 'error');
+    return;
+  }
+
+  const first = sweep.levels[0] / 100;
+  const last = sweep.levels[sweep.levels.length - 1] / 100;
+  const ok = window.confirm(
+    `This turns the laser output ON at ${first.toFixed(2)} A, steps it up to ${last.toFixed(2)} A ` +
+      `(${sweep.total} steps, ${formatDuration(sweep.durationS)}), then turns it OFF.\n\n` +
+      'Check the interlocks, beam path and eye protection, and start the StarLab recording first.\n\nStart the sweep?'
+  );
+  if (!ok) return;
+
+  state.sweep = sweep;
+  state.sweepStartedAt = performance.now();
+  setSweepUI(true);
+  sweep.start();
+  state.sweepTimer = window.setInterval(showSweepProgress, 200);
+  setStatus('LI sweep running. Press Abort Sweep or Off to stop.', 'ok');
+}
+
+/**
+ * If the board reports the output off mid-sweep (interlock, fault, timeout),
+ * stop stepping rather than walking the setpoint up with nothing lasing.
+ * Ignore the first couple of seconds, while the poll may still show the state
+ * from before lO1 was processed.
+ */
+function watchSweepOutput(outputOn) {
+  const sweep = state.sweep;
+  if (!sweep || !sweep.running || outputOn) return;
+  if (performance.now() - state.sweepStartedAt < 2000) return;
+  sweep.abort('Sweep stopped: the board reported the laser output off.');
+}
+
+/** Wait (bounded) for queued commands to go out. */
+async function waitForTx(maxMs) {
+  const safr = state.safr;
+  const deadline = performance.now() + maxMs;
+  while (safr && safr.transport.pending > 0 && performance.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+}
+
+ui.sweepButton.addEventListener('click', () => {
+  if (state.sweep && state.sweep.running) state.sweep.abort('Sweep aborted. Laser off.');
+  else startSweep();
+});
+
+SWEEP_FIELDS().forEach((node) => node.addEventListener('input', describeSweepPlan));
 
 // ------------------------------------------------------------------- boot-up
 
